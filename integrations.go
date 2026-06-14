@@ -21,6 +21,10 @@ type repositoryOption struct {
 	URL           string `json:"url"`
 }
 
+type openAIModel struct {
+	ID string `json:"id"`
+}
+
 func (s *store) testConnection(ctx context.Context, provider string, settings appSettings) (string, error) {
 	switch provider {
 	case "github":
@@ -43,10 +47,45 @@ func (s *store) testConnection(ctx context.Context, provider string, settings ap
 		if settings.OpenAIKey == "" {
 			return "", errors.New("OpenAI API key is not configured")
 		}
-		return "OpenAI is configured with model " + settings.OpenAIModel, nil
+		if _, err := s.fetchOpenAIModels(ctx, settings); err != nil {
+			return "", err
+		}
+		return "OpenAI is configured and models are available", nil
 	default:
 		return "", errors.New("unknown provider")
 	}
+}
+
+func (s *store) fetchOpenAIModels(ctx context.Context, settings appSettings) ([]openAIModel, error) {
+	if settings.OpenAIKey == "" {
+		return nil, errors.New("OpenAI API key is not configured")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.openai.com/v1/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+settings.OpenAIKey)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, safeOpenAIError(resp)
+	}
+	var payload struct {
+		Data []openAIModel `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	models := make([]openAIModel, 0, len(payload.Data))
+	for _, model := range payload.Data {
+		if strings.Contains(model.ID, "gpt") || strings.Contains(model.ID, "o") {
+			models = append(models, model)
+		}
+	}
+	return models, nil
 }
 
 func (s *store) fetchRepositories(ctx context.Context, provider string, settings appSettings) ([]repositoryOption, error) {
@@ -141,6 +180,191 @@ func (s *store) fetchHistory(ctx context.Context, provider, repository, ref stri
 	}
 }
 
+func (s *store) fetchReleaseContext(ctx context.Context, provider, repository, baseRef, releaseRef string, settings appSettings) (releaseContext, error) {
+	history, err := s.fetchHistory(ctx, provider, repository, releaseRef, settings)
+	if err != nil {
+		return releaseContext{}, err
+	}
+	files, err := s.fetchChangedFiles(ctx, provider, repository, baseRef, releaseRef, settings)
+	if err != nil {
+		return releaseContext{}, err
+	}
+	ctxData := enrichReleaseContext(releaseContext{
+		Commits:      history,
+		ChangedFiles: files,
+	})
+	ci, err := s.fetchCIStatus(ctx, provider, repository, releaseRef, settings)
+	if err == nil {
+		ctxData.CI = ci
+	}
+	return ctxData, nil
+}
+
+func (s *store) fetchChangedFiles(ctx context.Context, provider, repository, baseRef, releaseRef string, settings appSettings) ([]changedFile, error) {
+	switch provider {
+	case "github":
+		endpoint := "https://api.github.com/repos/" + strings.Trim(repository, "/") + "/compare/" + url.PathEscape(baseRef) + "..." + url.PathEscape(releaseRef)
+		var response struct {
+			Files []struct {
+				Filename  string `json:"filename"`
+				Status    string `json:"status"`
+				Additions int    `json:"additions"`
+				Deletions int    `json:"deletions"`
+				Patch     string `json:"patch"`
+			} `json:"files"`
+		}
+		if err := s.providerJSON(ctx, endpoint, settings.GitHub.Token, "github", &response); err != nil {
+			return nil, err
+		}
+		files := make([]changedFile, 0, len(response.Files))
+		for _, f := range response.Files {
+			files = append(files, changedFile{Path: f.Filename, Status: f.Status, Additions: f.Additions, Deletions: f.Deletions, Patch: f.Patch})
+		}
+		return files, nil
+	case "gitlab":
+		endpoint := "https://gitlab.com/api/v4/projects/" + url.PathEscape(repository) + "/repository/compare?from=" + url.QueryEscape(baseRef) + "&to=" + url.QueryEscape(releaseRef)
+		var response struct {
+			Diffs []struct {
+				NewPath string `json:"new_path"`
+				OldPath string `json:"old_path"`
+				Diff    string `json:"diff"`
+				NewFile bool   `json:"new_file"`
+				Deleted bool   `json:"deleted_file"`
+			} `json:"diffs"`
+		}
+		if err := s.providerJSON(ctx, endpoint, settings.GitLab.Token, "gitlab", &response); err != nil {
+			return nil, err
+		}
+		files := make([]changedFile, 0, len(response.Diffs))
+		for _, f := range response.Diffs {
+			path := f.NewPath
+			if path == "" {
+				path = f.OldPath
+			}
+			status := "modified"
+			if f.NewFile {
+				status = "added"
+			}
+			if f.Deleted {
+				status = "deleted"
+			}
+			files = append(files, changedFile{Path: path, Status: status, Patch: f.Diff})
+		}
+		return files, nil
+	default:
+		return nil, errors.New("provider must be github or gitlab")
+	}
+}
+
+func (s *store) fetchCIStatus(ctx context.Context, provider, repository, ref string, settings appSettings) (providerSignal, error) {
+	switch provider {
+	case "github":
+		endpoint := "https://api.github.com/repos/" + strings.Trim(repository, "/") + "/actions/runs?branch=" + url.QueryEscape(ref) + "&per_page=1"
+		var response struct {
+			WorkflowRuns []struct {
+				Name       string `json:"name"`
+				Status     string `json:"status"`
+				Conclusion string `json:"conclusion"`
+				HTMLURL    string `json:"html_url"`
+			} `json:"workflow_runs"`
+		}
+		if err := s.providerJSON(ctx, endpoint, settings.GitHub.Token, "github", &response); err != nil {
+			return providerSignal{}, err
+		}
+		if len(response.WorkflowRuns) == 0 {
+			return providerSignal{Name: "GitHub Actions", Status: "Pending", Evidence: "No workflow run found for " + ref}, nil
+		}
+		run := response.WorkflowRuns[0]
+		return providerSignal{Name: "GitHub Actions", Status: ciStatus(run.Status, run.Conclusion), Evidence: run.Name + " " + emptyAs(run.Conclusion, run.Status), URL: run.HTMLURL}, nil
+	case "gitlab":
+		endpoint := "https://gitlab.com/api/v4/projects/" + url.PathEscape(repository) + "/pipelines?ref=" + url.QueryEscape(ref) + "&per_page=1"
+		var response []struct {
+			Status string `json:"status"`
+			WebURL string `json:"web_url"`
+		}
+		if err := s.providerJSON(ctx, endpoint, settings.GitLab.Token, "gitlab", &response); err != nil {
+			return providerSignal{}, err
+		}
+		if len(response) == 0 {
+			return providerSignal{Name: "GitLab CI", Status: "Pending", Evidence: "No pipeline found for " + ref}, nil
+		}
+		return providerSignal{Name: "GitLab CI", Status: ciStatus(response[0].Status, response[0].Status), Evidence: "Pipeline " + response[0].Status, URL: response[0].WebURL}, nil
+	default:
+		return providerSignal{}, errors.New("provider must be github or gitlab")
+	}
+}
+
+func scanSecrets(files []changedFile) providerSignal {
+	matches := []string{}
+	for _, file := range files {
+		lower := strings.ToLower(file.Path)
+		patch := strings.ToLower(file.Patch)
+		if strings.Contains(lower, ".env") || strings.Contains(lower, "secret") || strings.Contains(lower, "credential") ||
+			strings.Contains(patch, "api_key") || strings.Contains(patch, "apikey") || strings.Contains(patch, "password=") ||
+			strings.Contains(patch, "private_key") || strings.Contains(patch, "secret") {
+			matches = append(matches, file.Path)
+		}
+	}
+	if len(matches) == 0 {
+		return providerSignal{Name: "Secret scan", Status: "Passed", Evidence: "No .env or credential-like changes detected"}
+	}
+	return providerSignal{Name: "Secret scan", Status: "Failed", Evidence: strings.Join(uniqueStrings(matches), ", ")}
+}
+
+func scanDatabaseChanges(files []changedFile) providerSignal {
+	matches := pathsMatching(files, []string{"migration", "migrations/", ".sql", "schema.sql", "db/", "database/"})
+	if len(matches) == 0 {
+		return providerSignal{Name: "Database changes", Status: "Passed", Evidence: "No database migration files detected"}
+	}
+	return providerSignal{Name: "Database changes", Status: "Warning", Evidence: strings.Join(matches, ", ")}
+}
+
+func scanSchemaChanges(files []changedFile) providerSignal {
+	matches := pathsMatching(files, []string{"openapi", "swagger", "schema", "graphql", ".proto", "api/"})
+	if len(matches) == 0 {
+		return providerSignal{Name: "Schema changes", Status: "Passed", Evidence: "No API/schema files detected"}
+	}
+	return providerSignal{Name: "Schema changes", Status: "Warning", Evidence: strings.Join(matches, ", ")}
+}
+
+func pathsMatching(files []changedFile, needles []string) []string {
+	matches := []string{}
+	for _, file := range files {
+		lower := strings.ToLower(file.Path)
+		for _, needle := range needles {
+			if strings.Contains(lower, needle) {
+				matches = append(matches, file.Path)
+				break
+			}
+		}
+	}
+	return uniqueStrings(matches)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	result := []string{}
+	for _, value := range values {
+		if value != "" && !seen[value] {
+			seen[value] = true
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func ciStatus(status, conclusion string) string {
+	status = strings.ToLower(status)
+	conclusion = strings.ToLower(conclusion)
+	if conclusion == "success" || status == "success" {
+		return "Passed"
+	}
+	if conclusion == "failure" || conclusion == "cancelled" || conclusion == "timed_out" || status == "failed" || status == "canceled" {
+		return "Failed"
+	}
+	return "Pending"
+}
+
 func (s *store) providerJSON(ctx context.Context, endpoint, token, provider string, target any) error {
 	if token == "" {
 		return fmt.Errorf("%s token is not configured", provider)
@@ -163,8 +387,17 @@ func (s *store) providerJSON(ctx context.Context, endpoint, token, provider stri
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 800))
-		return fmt.Errorf("%s API returned %s: %s", provider, resp.Status, strings.TrimSpace(string(body)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 800))
+		switch resp.StatusCode {
+		case http.StatusUnauthorized:
+			return fmt.Errorf("%s credentials were rejected", provider)
+		case http.StatusForbidden:
+			return fmt.Errorf("%s token does not have the required read-only permissions", provider)
+		case http.StatusNotFound:
+			return fmt.Errorf("%s resource was not found or is not visible to this token", provider)
+		default:
+			return fmt.Errorf("%s API returned %s", provider, resp.Status)
+		}
 	}
 	return json.NewDecoder(resp.Body).Decode(target)
 }
@@ -179,8 +412,8 @@ type aiReport struct {
 	ReleaseNotes   []string `json:"releaseNotes"`
 }
 
-func (s *store) generateAIReport(ctx context.Context, settings appSettings, input analyzeRequest, history []commit) (aiReport, error) {
-	historyJSON, _ := json.Marshal(history)
+func (s *store) generateAIReport(ctx context.Context, settings appSettings, input analyzeRequest, ctxData releaseContext) (aiReport, error) {
+	contextJSON, _ := json.Marshal(ctxData)
 	schema := map[string]any{
 		"type": "object", "additionalProperties": false,
 		"required": []string{"decision", "health", "summary", "recommendation", "risks", "rollbackPlan", "releaseNotes"},
@@ -199,8 +432,8 @@ func (s *store) generateAIReport(ctx context.Context, settings appSettings, inpu
 	}
 	payload := map[string]any{
 		"model":        settings.OpenAIModel,
-		"instructions": "You are ReleasePilot, a cautious release manager. Analyze only the supplied repository history. Be concise, cite commit SHAs in evidence, and do not invent test or production results.",
-		"input":        fmt.Sprintf("Create a release readiness report for provider=%s repository=%s base=%s release=%s. Recent commits: %s", input.Provider, input.Repository, input.BaseBranch, input.ReleaseBranch, historyJSON),
+		"instructions": "You are ReleasePilot, a cautious release manager. Analyze only the supplied repository signals. Be concise, cite commit SHAs or changed file paths in evidence, and do not invent test or production results. Give useful engineering feedback for the dashboard.",
+		"input":        fmt.Sprintf("Create a release readiness report for provider=%s repository=%s base=%s release=%s. Repository signals: %s", input.Provider, input.Repository, input.BaseBranch, input.ReleaseBranch, contextJSON),
 		"text":         map[string]any{"format": map[string]any{"type": "json_schema", "name": "release_report", "strict": true, "schema": schema}},
 	}
 	body, _ := json.Marshal(payload)

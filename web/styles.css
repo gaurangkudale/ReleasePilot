@@ -155,6 +155,10 @@ h3 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacin
 .settings-grid { max-width: 1050px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .settings-card p { min-height: 40px; line-height: 1.5; }
 .settings-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; }
+.inline-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.model-list { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 12px; }
+.model-chip { border: 1px solid var(--line); border-radius: 999px; padding: 6px 9px; color: var(--text); background: var(--bg); font-size: 12px; }
+.model-chip:hover { border-color: var(--green); color: var(--green); }
 .connection-status { color: var(--muted); font-size: 11px; }
 .connection-status.configured { color: var(--green); }
 dialog { width: min(580px, calc(100% - 30px)); padding: 0; border: 1px solid var(--line); border-radius: 6px; color: var(--text); background: var(--surface-2); }

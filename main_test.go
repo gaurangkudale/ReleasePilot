@@ -10,7 +10,7 @@ import (
 )
 
 func TestHealth(t *testing.T) {
-	handler, err := newHandler(newStore())
+	handler, err := newHandler(testStore(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ type readCloser struct {
 func (r *readCloser) Close() error { return nil }
 
 func TestAnalyzeRelease(t *testing.T) {
-	s := newStore()
+	s := testStore(t)
 	s.settings.OpenAIKey = ""
 	handler, err := newHandler(s)
 	if err != nil {
@@ -78,7 +78,7 @@ func TestAnalyzeRelease(t *testing.T) {
 }
 
 func TestSettingsNeverReturnTokens(t *testing.T) {
-	s := newStore()
+	s := testStore(t)
 	s.settings.GitHub = providerSecret{Username: "octocat", Token: "secret-token"}
 	handler, err := newHandler(s)
 	if err != nil {
@@ -96,7 +96,9 @@ func TestSettingsNeverReturnTokens(t *testing.T) {
 }
 
 func TestPDFExport(t *testing.T) {
-	s := newStore()
+	s := testStore(t)
+	item := deterministicRelease(analyzeRequest{Provider: "github", Repository: "acme/platform", BaseBranch: "main", ReleaseBranch: "release/v1"}, releaseContext{})
+	s.releases[item.ID] = item
 	handler, err := newHandler(s)
 	if err != nil {
 		t.Fatal(err)
@@ -117,7 +119,7 @@ func TestPDFExport(t *testing.T) {
 }
 
 func TestAnalyzeRequiresRepository(t *testing.T) {
-	handler, err := newHandler(newStore())
+	handler, err := newHandler(testStore(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,4 +129,67 @@ func TestAnalyzeRequiresRepository(t *testing.T) {
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", response.Code)
 	}
+}
+
+func TestNewStoreDoesNotSeedDemoReports(t *testing.T) {
+	s := testStore(t)
+	if len(s.releases) != 0 {
+		t.Fatalf("expected no seeded reports, got %d", len(s.releases))
+	}
+}
+
+func TestReportsPersistAndReload(t *testing.T) {
+	path := t.TempDir() + "/store.json"
+	t.Setenv("RELEASEPILOT_STORE", path)
+	s := newStore()
+	item := deterministicRelease(analyzeRequest{Provider: "github", Repository: "acme/platform", BaseBranch: "main", ReleaseBranch: "release/v1"}, releaseContext{})
+	s.releases[item.ID] = item
+	if err := s.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := newStore()
+	if _, ok := reloaded.releases[item.ID]; !ok {
+		t.Fatal("expected persisted release after reload")
+	}
+}
+
+func TestDemoReportsFilteredOnLoad(t *testing.T) {
+	path := t.TempDir() + "/store.json"
+	t.Setenv("RELEASEPILOT_STORE", path)
+	s := newStore()
+	demo := deterministicRelease(analyzeRequest{Provider: "demo", Repository: "acme/platform", BaseBranch: "main", ReleaseBranch: "release/v1"}, releaseContext{})
+	real := deterministicRelease(analyzeRequest{Provider: "github", Repository: "acme/platform", BaseBranch: "main", ReleaseBranch: "release/v1"}, releaseContext{})
+	s.releases[demo.ID] = demo
+	s.releases[real.ID] = real
+	if err := s.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := newStore()
+	if _, ok := reloaded.releases[demo.ID]; ok {
+		t.Fatal("demo release should be filtered on load")
+	}
+	if _, ok := reloaded.releases[real.ID]; !ok {
+		t.Fatal("real release should remain on load")
+	}
+}
+
+func TestRepositorySignalDetection(t *testing.T) {
+	ctx := releaseContext{ChangedFiles: []changedFile{
+		{Path: ".env.production", Patch: "+OPENAI_API_KEY=abc"},
+		{Path: "migrations/001_create_users.sql"},
+		{Path: "api/openapi.yaml"},
+	}}
+	report := deterministicRelease(analyzeRequest{Provider: "github", Repository: "acme/platform", BaseBranch: "main", ReleaseBranch: "release/v1"}, ctx)
+	joined, _ := json.Marshal(report)
+	for _, want := range []string{"Possible credentials", "Database migration", "Schema or API contract"} {
+		if !bytes.Contains(joined, []byte(want)) {
+			t.Fatalf("expected report to include %q: %s", want, joined)
+		}
+	}
+}
+
+func testStore(t *testing.T) *store {
+	t.Helper()
+	t.Setenv("RELEASEPILOT_STORE", t.TempDir()+"/store.json")
+	return newStore()
 }

@@ -29,6 +29,8 @@ document.addEventListener("click", async (event) => {
   if (event.target.closest("[data-export-pdf]") && currentRelease) exportPDF(currentRelease);
   const test = event.target.closest("[data-test-provider]");
   if (test) testConnection(test.dataset.testProvider, test);
+  const loadModels = event.target.closest("[data-load-models]");
+  if (loadModels) fetchModels(loadModels);
 });
 
 document.addEventListener("submit", async (event) => {
@@ -158,15 +160,41 @@ async function testConnection(provider, button) {
   button.disabled = true;
   const original = button.textContent;
   button.textContent = "Testing...";
+  const settingsForm = document.querySelector("#settings-form");
+  const values = settingsForm ? Object.fromEntries(new FormData(settingsForm)) : {};
   const response = await fetch("/api/connections/test", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ provider }),
+    body: JSON.stringify({
+      provider,
+      username: values[`${provider}Username`] || "",
+      token: values[`${provider}Token`] || "",
+      apiKey: values.openaiKey || "",
+      model: values.openaiModel || "",
+    }),
   });
   const result = response.ok ? await response.json() : { message: await response.text() };
   button.disabled = false;
   button.textContent = original;
   showToast(result.message);
+}
+
+async function fetchModels(button) {
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = "Loading models...";
+  const response = await fetch("/api/openai/models");
+  button.disabled = false;
+  button.textContent = original;
+  const modelList = document.querySelector("#model-list");
+  if (!response.ok) {
+    modelList.innerHTML = `<p class="form-error">${escapeHTML(await response.text())}</p>`;
+    return;
+  }
+  const models = await response.json();
+  modelList.innerHTML = models.length
+    ? `<div class="model-list">${models.map(model => `<button type="button" class="model-chip" data-model-id="${escapeHTML(model.id)}">${escapeHTML(model.id)}</button>`).join("")}</div>`
+    : `<p class="meta">No compatible models returned for this key.</p>`;
 }
 
 function renderLoading() {
@@ -198,7 +226,7 @@ function renderCockpit(item) {
       <div>
         <button class="back-link icon-button" data-route="releases">← All releases</button>
         <h1>${escapeHTML(item.name)} <span class="badge">${item.aiGenerated ? "OpenAI report" : "Rule-based report"}</span></h1>
-        <p class="meta">${escapeHTML(item.provider)} · ${escapeHTML(item.repository)} · ${item.commits.length} commits · ${formatDate(item.createdAt)}</p>
+        <p class="meta">${escapeHTML(item.provider)} · ${escapeHTML(item.repository)} · ${item.commits.length} commits · ${item.changedFiles.length} changed files · ${formatDate(item.createdAt)}</p>
       </div>
       <div class="header-actions"><button class="button secondary" data-reanalyze>Re-analyze</button><button class="button primary" data-export-pdf>Export PDF</button></div>
     </header>
@@ -225,6 +253,7 @@ function renderCockpit(item) {
         ${tablePanel("Validation checklist", `${item.validations.filter(v => v.status === "Passed").length}/${item.validations.length} passed`, ["Validation","Status","Evidence"], item.validations.map(v => [`<i class="status-dot ${escapeHTML(v.status)}"></i>${escapeHTML(v.name)}`, `<span class="${v.status === "Passed" ? "low" : "medium"}">${escapeHTML(v.status)}</span>`, `<span class="evidence">${escapeHTML(v.evidence)}</span>`]))}
         ${tablePanel("Risk findings", `${item.risks.length} detected`, ["Risk","Level","Impact","Evidence"], item.risks.map(r => [escapeHTML(r.title), `<span class="${r.level.toLowerCase()}">${escapeHTML(r.level)}</span>`, escapeHTML(r.impact), `<span class="evidence">${escapeHTML(r.evidence)}</span>`]))}
         ${tablePanel("Affected services", `${item.services.length} services`, ["Service","Change","Blast radius"], item.services.map(s => [escapeHTML(s.name), escapeHTML(s.change), `<span class="${s.blastRadius.toLowerCase()}">${escapeHTML(s.blastRadius)}</span>`]), "services-panel")}
+        ${tablePanel("Changed files", `${item.changedFiles.length} files`, ["Path","Status","+/-"], item.changedFiles.slice(0, 8).map(f => [escapeHTML(f.path), escapeHTML(f.status), `+${f.additions} / -${f.deletions}`]), "files-panel")}
       </div>
       <div class="bottom-grid">
         <section class="panel"><div class="panel-header"><h3>Rollback plan</h3></div><ol class="steps">${item.rollbackPlan.map(step => `<li>${escapeHTML(step)}</li>`).join("")}</ol></section>
@@ -243,7 +272,8 @@ function renderSettings(config) {
         <p class="meta">OpenAI generates the release summary, risk report, rollback plan, and release notes.</p>
         <label>API key<input type="password" name="openaiKey" autocomplete="new-password" placeholder="${config.openai.configured ? "Configured · leave blank to keep" : "Enter API key"}"></label>
         <label>Model<input name="openaiModel" value="${escapeHTML(config.openai.model)}" required></label>
-        <button type="button" class="button secondary" data-test-provider="openai">Check configuration</button>
+        <div class="inline-actions"><button type="button" class="button secondary" data-test-provider="openai">Check configuration</button><button type="button" class="button secondary" data-load-models>List models</button></div>
+        <div id="model-list"></div>
       </section>
       <section class="panel settings-card">
         <div class="panel-header"><h3>Appearance</h3></div>
@@ -267,6 +297,13 @@ function providerSettings(title, key, config, guidance) {
 function tablePanel(title, meta, headers, rows, className = "") {
   return `<section class="panel ${className}"><div class="panel-header"><h3>${title}</h3><span class="meta">${meta}</span></div><div class="table-wrap"><table class="table"><thead><tr>${headers.map(h => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.map(row => `<tr>${row.map(cell => `<td>${cell}</td>`).join("")}</tr>`).join("")}</tbody></table></div></section>`;
 }
+
+document.addEventListener("click", (event) => {
+  const model = event.target.closest("[data-model-id]");
+  if (!model) return;
+  const input = document.querySelector('input[name="openaiModel"]');
+  if (input) input.value = model.dataset.modelId;
+});
 
 function decisionOption(name, subtitle, className, selected) {
   return `<div class="decision-option ${className} ${name === selected ? "active" : ""}"><strong>${name}</strong><span>${subtitle}</span></div>`;

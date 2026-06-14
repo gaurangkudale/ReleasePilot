@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -45,27 +46,52 @@ type commit struct {
 	URL     string    `json:"url"`
 }
 
+type changedFile struct {
+	Path      string `json:"path"`
+	Status    string `json:"status"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+	Patch     string `json:"patch,omitempty"`
+}
+
+type providerSignal struct {
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	Evidence string `json:"evidence"`
+	URL      string `json:"url,omitempty"`
+}
+
+type releaseContext struct {
+	Commits      []commit       `json:"commits"`
+	ChangedFiles []changedFile  `json:"changedFiles"`
+	CI           providerSignal `json:"ci"`
+	Security     providerSignal `json:"security"`
+	Database     providerSignal `json:"database"`
+	Schema       providerSignal `json:"schema"`
+}
+
 type release struct {
-	ID             string       `json:"id"`
-	Name           string       `json:"name"`
-	Provider       string       `json:"provider"`
-	Repository     string       `json:"repository"`
-	BaseBranch     string       `json:"baseBranch"`
-	ReleaseBranch  string       `json:"releaseBranch"`
-	CreatedAt      time.Time    `json:"createdAt"`
-	InitiatedBy    string       `json:"initiatedBy"`
-	Target         string       `json:"target"`
-	Decision       string       `json:"decision"`
-	Summary        string       `json:"summary"`
-	Recommendation string       `json:"recommendation"`
-	Health         int          `json:"health"`
-	AIGenerated    bool         `json:"aiGenerated"`
-	Commits        []commit     `json:"commits"`
-	Validations    []validation `json:"validations"`
-	Risks          []risk       `json:"risks"`
-	Services       []service    `json:"services"`
-	RollbackPlan   []string     `json:"rollbackPlan"`
-	ReleaseNotes   []string     `json:"releaseNotes"`
+	ID             string        `json:"id"`
+	Name           string        `json:"name"`
+	Provider       string        `json:"provider"`
+	Repository     string        `json:"repository"`
+	BaseBranch     string        `json:"baseBranch"`
+	ReleaseBranch  string        `json:"releaseBranch"`
+	CreatedAt      time.Time     `json:"createdAt"`
+	InitiatedBy    string        `json:"initiatedBy"`
+	Target         string        `json:"target"`
+	Decision       string        `json:"decision"`
+	Summary        string        `json:"summary"`
+	Recommendation string        `json:"recommendation"`
+	Health         int           `json:"health"`
+	AIGenerated    bool          `json:"aiGenerated"`
+	Commits        []commit      `json:"commits"`
+	ChangedFiles   []changedFile `json:"changedFiles"`
+	Validations    []validation  `json:"validations"`
+	Risks          []risk        `json:"risks"`
+	Services       []service     `json:"services"`
+	RollbackPlan   []string      `json:"rollbackPlan"`
+	ReleaseNotes   []string      `json:"releaseNotes"`
 }
 
 type analyzeRequest struct {
@@ -123,6 +149,7 @@ type store struct {
 	releases map[string]release
 	settings appSettings
 	client   *http.Client
+	path     string
 }
 
 func main() {
@@ -137,6 +164,10 @@ func main() {
 }
 
 func newStore() *store {
+	dataPath := os.Getenv("RELEASEPILOT_STORE")
+	if dataPath == "" {
+		dataPath = filepath.Join(".releasepilot", "store.json")
+	}
 	s := &store{
 		releases: make(map[string]release),
 		settings: appSettings{
@@ -144,14 +175,11 @@ func newStore() *store {
 			OpenAIModel: "gpt-5.2",
 		},
 		client: &http.Client{Timeout: 25 * time.Second},
+		path:   dataPath,
 	}
-	sample := deterministicRelease(analyzeRequest{
-		Provider:      "demo",
-		Repository:    "acme/payment-platform",
-		BaseBranch:    "main",
-		ReleaseBranch: "release/v2.14.0",
-	}, nil)
-	s.releases[sample.ID] = sample
+	if err := s.load(); err != nil {
+		log.Printf("ReleasePilot persistence disabled until next save: %v", err)
+	}
 	return s
 }
 
@@ -162,6 +190,7 @@ func newHandler(s *store) (http.Handler, error) {
 	})
 	mux.HandleFunc("/api/settings", s.handleSettings)
 	mux.HandleFunc("/api/connections/test", s.handleConnectionTest)
+	mux.HandleFunc("/api/openai/models", s.handleOpenAIModels)
 	mux.HandleFunc("/api/repositories", s.handleRepositories)
 	mux.HandleFunc("/api/history", s.handleHistory)
 	mux.HandleFunc("/api/releases", s.handleReleases)
@@ -205,7 +234,12 @@ func (s *store) handleSettings(w http.ResponseWriter, r *http.Request) {
 			s.settings.OpenAIModel = strings.TrimSpace(input.OpenAI.Model)
 		}
 		view := s.settings.view()
+		err := s.saveLocked()
 		s.mu.Unlock()
+		if err != nil {
+			http.Error(w, "settings saved in memory but persistence failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 		writeJSON(w, http.StatusOK, view)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -219,6 +253,10 @@ func (s *store) handleConnectionTest(w http.ResponseWriter, r *http.Request) {
 	}
 	var input struct {
 		Provider string `json:"provider"`
+		Username string `json:"username"`
+		Token    string `json:"token"`
+		APIKey   string `json:"apiKey"`
+		Model    string `json:"model"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -227,12 +265,29 @@ func (s *store) handleConnectionTest(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	settings := s.settings
 	s.mu.RUnlock()
+	settings.applyTestOverrides(input.Provider, input.Username, input.Token, input.APIKey, input.Model)
 	message, err := s.testConnection(r.Context(), input.Provider, settings)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "message": message})
+}
+
+func (s *store) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.mu.RLock()
+	settings := s.settings
+	s.mu.RUnlock()
+	models, err := s.fetchOpenAIModels(r.Context(), settings)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, models)
 }
 
 func (s *store) handleRepositories(w http.ResponseWriter, r *http.Request) {
@@ -276,7 +331,7 @@ func (s *store) handleReleases(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	items := make([]release, 0, len(s.releases))
 	for _, item := range s.releases {
-		items = append(items, item)
+		items = append(items, normalizeRelease(item))
 	}
 	s.mu.RUnlock()
 	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt.After(items[j].CreatedAt) })
@@ -300,7 +355,7 @@ func (s *store) handleRelease(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "release not found", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, http.StatusOK, item)
+	writeJSON(w, http.StatusOK, normalizeRelease(item))
 }
 
 func (s *store) handleAnalyze(w http.ResponseWriter, r *http.Request) {
@@ -322,19 +377,19 @@ func (s *store) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	settings := s.settings
 	s.mu.RUnlock()
 
-	var history []commit
+	ctx := releaseContext{}
 	var err error
 	if input.Provider != "" && input.Provider != "demo" {
-		history, err = s.fetchHistory(r.Context(), input.Provider, input.Repository, input.ReleaseBranch, settings)
+		ctx, err = s.fetchReleaseContext(r.Context(), input.Provider, input.Repository, input.BaseBranch, input.ReleaseBranch, settings)
 		if err != nil {
-			http.Error(w, "repository history: "+err.Error(), http.StatusBadGateway)
+			http.Error(w, "repository analysis: "+err.Error(), http.StatusBadGateway)
 			return
 		}
 	}
 
-	item := deterministicRelease(input, history)
+	item := deterministicRelease(input, ctx)
 	if settings.OpenAIKey != "" {
-		aiReport, aiErr := s.generateAIReport(r.Context(), settings, input, history)
+		aiReport, aiErr := s.generateAIReport(r.Context(), settings, input, ctx)
 		if aiErr != nil {
 			item.Summary += " AI generation was unavailable: " + aiErr.Error()
 		} else {
@@ -351,7 +406,12 @@ func (s *store) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	s.releases[item.ID] = item
+	err = s.saveLocked()
 	s.mu.Unlock()
+	if err != nil {
+		http.Error(w, "analysis completed but persistence failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, http.StatusCreated, item)
 }
 
@@ -371,10 +431,14 @@ func validateAnalyzeRequest(input analyzeRequest) error {
 	return nil
 }
 
-func deterministicRelease(input analyzeRequest, history []commit) release {
+func deterministicRelease(input analyzeRequest, ctx releaseContext) release {
 	now := time.Now().UTC()
-	if history == nil {
-		history = []commit{}
+	ctx = enrichReleaseContext(ctx)
+	if ctx.Commits == nil {
+		ctx.Commits = []commit{}
+	}
+	if ctx.ChangedFiles == nil {
+		ctx.ChangedFiles = []changedFile{}
 	}
 	branchName := strings.TrimPrefix(input.ReleaseBranch, "release/")
 	decision := "NEEDS VALIDATION"
@@ -399,22 +463,21 @@ func deterministicRelease(input analyzeRequest, history []commit) release {
 		InitiatedBy:    "release.manager@acme.com",
 		Target:         "Production",
 		Decision:       decision,
-		Summary:        fmt.Sprintf("Analyzed %d recent commits from %s. Review the evidence and validations before release.", len(history), input.Repository),
+		Summary:        fmt.Sprintf("Analyzed %d commits and %d changed files from %s. Review CI, security, schema, and database signals before release.", len(ctx.Commits), len(ctx.ChangedFiles), input.Repository),
 		Recommendation: recommendation,
 		Health:         health,
-		Commits:        history,
+		Commits:        ctx.Commits,
+		ChangedFiles:   ctx.ChangedFiles,
 		Validations: []validation{
-			{Name: "Repository history fetched", Status: "Passed", Evidence: fmt.Sprintf("%d commits", len(history))},
-			{Name: "Unit and integration tests", Status: "Pending", Evidence: "Connect CI provider"},
-			{Name: "Security scans", Status: "Pending", Evidence: "Connect security scanner"},
+			{Name: "Repository history fetched", Status: statusFromCount(len(ctx.Commits)), Evidence: fmt.Sprintf("%d commits, %d changed files", len(ctx.Commits), len(ctx.ChangedFiles))},
+			{Name: "CI validation", Status: ctx.CI.Status, Evidence: emptyAs(ctx.CI.Evidence, "No pipeline data found")},
+			{Name: "Security scan", Status: ctx.Security.Status, Evidence: emptyAs(ctx.Security.Evidence, "No credential files detected")},
 			{Name: "Dependency checks", Status: "Passed", Evidence: "History reviewed"},
+			{Name: "Database/schema review", Status: worstStatus(ctx.Database.Status, ctx.Schema.Status), Evidence: strings.TrimSpace(ctx.Database.Evidence + " " + ctx.Schema.Evidence)},
 			{Name: "Canary analysis", Status: "Pending", Evidence: "Not run"},
 			{Name: "Rollback rehearsal", Status: "Pending", Evidence: "Not run"},
 		},
-		Risks: []risk{
-			{Title: "Release includes unvalidated repository changes", Level: "High", Impact: "Release safety", Evidence: input.ReleaseBranch},
-			{Title: "CI and runtime signals are not connected", Level: "Medium", Impact: "Confidence", Evidence: "Settings"},
-		},
+		Risks:    deterministicRisks(input, ctx),
 		Services: []service{{Name: name, Change: branchName, BlastRadius: "High"}},
 		RollbackPlan: []string{
 			"Pause the deployment and disable changed feature flags",
@@ -422,8 +485,47 @@ func deterministicRelease(input analyzeRequest, history []commit) release {
 			"Redeploy the last known-good artifact",
 			"Verify health checks and service-level objectives",
 		},
-		ReleaseNotes: releaseNotesFromCommits(history),
+		ReleaseNotes: releaseNotesFromCommits(ctx.Commits),
 	}
+}
+
+func enrichReleaseContext(ctx releaseContext) releaseContext {
+	if ctx.CI.Status == "" {
+		ctx.CI = providerSignal{Name: "CI validation", Status: "Pending", Evidence: "No CI result found"}
+	}
+	if ctx.Security.Status == "" {
+		ctx.Security = scanSecrets(ctx.ChangedFiles)
+	}
+	if ctx.Database.Status == "" {
+		ctx.Database = scanDatabaseChanges(ctx.ChangedFiles)
+	}
+	if ctx.Schema.Status == "" {
+		ctx.Schema = scanSchemaChanges(ctx.ChangedFiles)
+	}
+	return ctx
+}
+
+func deterministicRisks(input analyzeRequest, ctx releaseContext) []risk {
+	risks := []risk{}
+	if len(ctx.ChangedFiles) == 0 {
+		risks = append(risks, risk{Title: "No compare data available", Level: "Medium", Impact: "Release confidence", Evidence: input.ReleaseBranch})
+	}
+	if ctx.CI.Status != "Passed" {
+		risks = append(risks, risk{Title: "CI validation is not passing", Level: "High", Impact: "Release safety", Evidence: emptyAs(ctx.CI.Evidence, "No CI status")})
+	}
+	if ctx.Security.Status == "Failed" {
+		risks = append(risks, risk{Title: "Possible credentials or .env files in release", Level: "Critical", Impact: "Secret exposure", Evidence: ctx.Security.Evidence})
+	}
+	if ctx.Database.Status == "Warning" {
+		risks = append(risks, risk{Title: "Database migration detected", Level: "High", Impact: "Rollback complexity", Evidence: ctx.Database.Evidence})
+	}
+	if ctx.Schema.Status == "Warning" {
+		risks = append(risks, risk{Title: "Schema or API contract change detected", Level: "High", Impact: "Compatibility", Evidence: ctx.Schema.Evidence})
+	}
+	if len(risks) == 0 {
+		risks = append(risks, risk{Title: "No high-risk repository signals detected", Level: "Low", Impact: "Release confidence", Evidence: input.ReleaseBranch})
+	}
+	return risks
 }
 
 func releaseNotesFromCommits(history []commit) []string {
@@ -451,8 +553,82 @@ func (s appSettings) view() settingsView {
 	return view
 }
 
+func (s *appSettings) applyTestOverrides(provider, username, token, apiKey, model string) {
+	if model != "" {
+		s.OpenAIModel = strings.TrimSpace(model)
+	}
+	switch provider {
+	case "github":
+		if username != "" {
+			s.GitHub.Username = strings.TrimSpace(username)
+		}
+		if token != "" {
+			s.GitHub.Token = strings.TrimSpace(token)
+		}
+	case "gitlab":
+		if username != "" {
+			s.GitLab.Username = strings.TrimSpace(username)
+		}
+		if token != "" {
+			s.GitLab.Token = strings.TrimSpace(token)
+		}
+	case "openai":
+		if apiKey != "" {
+			s.OpenAIKey = strings.TrimSpace(apiKey)
+		}
+	}
+}
+
+func statusFromCount(count int) string {
+	if count == 0 {
+		return "Warning"
+	}
+	return "Passed"
+}
+
+func worstStatus(a, b string) string {
+	for _, status := range []string{"Failed", "Warning", "Pending"} {
+		if a == status || b == status {
+			return status
+		}
+	}
+	return "Passed"
+}
+
+func emptyAs(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func normalizeRelease(item release) release {
+	if item.Commits == nil {
+		item.Commits = []commit{}
+	}
+	if item.ChangedFiles == nil {
+		item.ChangedFiles = []changedFile{}
+	}
+	if item.Validations == nil {
+		item.Validations = []validation{}
+	}
+	if item.Risks == nil {
+		item.Risks = []risk{}
+	}
+	if item.Services == nil {
+		item.Services = []service{}
+	}
+	if item.RollbackPlan == nil {
+		item.RollbackPlan = []string{}
+	}
+	if item.ReleaseNotes == nil {
+		item.ReleaseNotes = []string{}
+	}
+	return item
 }

@@ -11,7 +11,7 @@ dependency-free HTML, CSS, and JavaScript frontend.
 
 ## MVP Scope
 
-The MVP analyzes one release candidate and presents:
+The product analyzes one release candidate and presents:
 
 - A `GO`, `NEEDS VALIDATION`, or `NO-GO` recommendation
 - A release health score and risk breakdown
@@ -20,10 +20,14 @@ The MVP analyzes one release candidate and presents:
 - Affected services and blast radius
 - A rollback plan
 - Generated release notes
+- GitHub Actions or GitLab CI validation status
+- Secret, `.env`, database migration, and schema/API contract signals
 
-ReleasePilot can fetch real repository history from GitHub and GitLab, then
-use OpenAI to generate an evidence-backed release report. A deterministic
-analyzer remains available as a demo and fallback.
+ReleasePilot can fetch real repository history from GitHub and GitLab, inspect
+changed files, read CI status, detect database/schema changes, scan for
+credential exposure, and use OpenAI to generate an evidence-backed release
+report. A deterministic analyzer remains available as a fallback when OpenAI is
+not configured or unavailable.
 
 ## User Workflow
 
@@ -47,6 +51,7 @@ flowchart LR
 flowchart LR
     UI[HTML CSS JavaScript UI] --> API[Go HTTP API]
     API --> Providers[GitHub and GitLab APIs]
+    Providers --> CI[GitHub Actions and GitLab CI]
     API --> OpenAI[OpenAI Responses API]
     API --> Analyzer[Release Analyzer]
     Analyzer --> Decision[Release Decision]
@@ -118,6 +123,11 @@ Returns repositories visible to the configured read-only provider token.
 
 Returns recent commit history for a repository ref.
 
+### `GET /api/openai/models`
+
+Returns models visible to the configured OpenAI key. The Settings page uses
+this to populate model choices after an API key is configured.
+
 ### `GET /api/releases/{id}/pdf`
 
 Downloads the release readiness report as a PDF.
@@ -153,21 +163,37 @@ go test ./...
 - GitLab tokens should use the `read_api` scope only.
 - Provider tokens and OpenAI keys are write-only in the UI and never returned
   by the API.
-- Credentials entered in Settings are held in server memory and reset when the
-  server restarts.
+- Credentials entered in Settings are persisted in the local state file for
+  this development setup.
+- `.releasepilot/` and env files are ignored by git.
 - For production deployment, replace in-memory secret storage with a managed
   secret store.
 
+## Local Persistence
+
+Reports and Settings are persisted to:
+
+```text
+.releasepilot/store.json
+```
+
+Override this path for testing or deployment:
+
+```bash
+RELEASEPILOT_STORE=/secure/path/store.json go run .
+```
+
 ## Current Limitations
 
-- Repository analysis currently uses commit history, not complete Git diffs.
-- CI/CD and runtime systems are not connected yet.
+- Repository analysis uses provider compare APIs and currently stores recent
+  commits plus changed-file metadata.
+- Runtime observability systems are not connected yet.
 - Release approvals and deployment execution are intentionally excluded.
 - Data is held in memory and resets when the server restarts.
 
 ## Next Milestones
 
-1. Parse compare diffs and repository metadata.
+1. Deepen compare diff parsing and repository metadata.
 2. Detect service boundaries, dependencies, and owners.
 3. Add specialized AI analysis agents.
 4. Connect GitHub pull requests and CI results.
