@@ -17,6 +17,7 @@
         <button class="nav-item active" data-route="releases">Releases</button>
         <button class="nav-item" data-route="settings">Settings</button>
       </nav>
+      <button class="theme-toggle" data-theme-toggle aria-label="Toggle light and dark theme">Light mode</button>
       <div class="connection">
         <span><i></i> Connected</span>
         <small>release.manager@acme.com</small>
@@ -36,10 +37,21 @@
         </div>
         <button type="button" class="icon-button" data-close aria-label="Close dialog">×</button>
       </div>
-      <label>Repository<input name="repository" value="acme/payment-platform" required></label>
+      <label>Provider
+        <select name="provider" id="analysis-provider">
+          <option value="github">GitHub</option>
+          <option value="gitlab">GitLab</option>
+          <option value="demo">Demo data</option>
+        </select>
+      </label>
+      <label>Repository
+        <select name="repository" id="analysis-repository" required>
+          <option value="">Select a configured repository</option>
+        </select>
+      </label>
       <div class="field-grid">
         <label>Base branch<input name="baseBranch" value="main" required></label>
-        <label>Release branch<input name="releaseBranch" value="release/v2.15.0" required></label>
+        <label>Release branch or ref<input name="releaseBranch" value="main" required></label>
       </div>
       <p class="form-error" id="form-error" role="alert"></p>
       <div class="modal-actions">
