@@ -72,8 +72,14 @@ func TestAnalyzeRelease(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Decision != "NO-GO" {
-		t.Fatalf("expected NO-GO, got %s", result.Decision)
+	if result.Decision != "NEEDS VALIDATION" {
+		t.Fatalf("expected NEEDS VALIDATION, got %s", result.Decision)
+	}
+	if len(result.Agents) == 0 {
+		t.Fatal("expected agent reports")
+	}
+	if len(result.BlastRadius.Nodes) == 0 {
+		t.Fatal("expected blast radius graph")
 	}
 }
 
@@ -115,6 +121,43 @@ func TestPDFExport(t *testing.T) {
 	}
 	if !bytes.HasPrefix(response.Body.Bytes(), []byte("%PDF-1.4")) {
 		t.Fatal("response is not a PDF")
+	}
+	for _, want := range []string{"Executive Summary", "Specialized Risk Agents", "Blast Radius", "Changed Files"} {
+		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
+			t.Fatalf("expected PDF to include %q", want)
+		}
+	}
+	if !bytes.Contains(response.Body.Bytes(), []byte("/Helvetica-Bold")) {
+		t.Fatal("expected styled PDF font resources")
+	}
+}
+
+func TestDeleteRelease(t *testing.T) {
+	path := t.TempDir() + "/store.json"
+	t.Setenv("RELEASEPILOT_STORE", path)
+	s := newStore()
+	item := deterministicRelease(analyzeRequest{Provider: "github", Repository: "acme/platform", BaseBranch: "main", ReleaseBranch: "release/v1"}, releaseContext{})
+	s.releases[item.ID] = item
+	if err := s.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := newHandler(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/releases/"+item.ID, nil))
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", response.Code, response.Body.String())
+	}
+	if _, ok := s.releases[item.ID]; ok {
+		t.Fatal("release remained in memory after delete")
+	}
+	reloaded := newStore()
+	if _, ok := reloaded.releases[item.ID]; ok {
+		t.Fatal("release remained in persisted store after delete")
 	}
 }
 
@@ -185,6 +228,12 @@ func TestRepositorySignalDetection(t *testing.T) {
 		if !bytes.Contains(joined, []byte(want)) {
 			t.Fatalf("expected report to include %q: %s", want, joined)
 		}
+	}
+	if len(report.Agents) != 4 {
+		t.Fatalf("expected 4 agent reports, got %d", len(report.Agents))
+	}
+	if len(report.BlastRadius.Nodes) == 0 {
+		t.Fatal("expected blast radius nodes")
 	}
 }
 

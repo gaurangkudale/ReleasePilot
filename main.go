@@ -61,6 +61,34 @@ type providerSignal struct {
 	URL      string `json:"url,omitempty"`
 }
 
+type agentReport struct {
+	Name       string `json:"name"`
+	Domain     string `json:"domain"`
+	Status     string `json:"status"`
+	Confidence int    `json:"confidence"`
+	Summary    string `json:"summary"`
+	Findings   []risk `json:"findings"`
+}
+
+type blastNode struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	Kind     string `json:"kind"`
+	Severity string `json:"severity"`
+	Evidence string `json:"evidence"`
+}
+
+type blastEdge struct {
+	From  string `json:"from"`
+	To    string `json:"to"`
+	Label string `json:"label"`
+}
+
+type blastRadiusGraph struct {
+	Nodes []blastNode `json:"nodes"`
+	Edges []blastEdge `json:"edges"`
+}
+
 type releaseContext struct {
 	Commits      []commit       `json:"commits"`
 	ChangedFiles []changedFile  `json:"changedFiles"`
@@ -71,27 +99,29 @@ type releaseContext struct {
 }
 
 type release struct {
-	ID             string        `json:"id"`
-	Name           string        `json:"name"`
-	Provider       string        `json:"provider"`
-	Repository     string        `json:"repository"`
-	BaseBranch     string        `json:"baseBranch"`
-	ReleaseBranch  string        `json:"releaseBranch"`
-	CreatedAt      time.Time     `json:"createdAt"`
-	InitiatedBy    string        `json:"initiatedBy"`
-	Target         string        `json:"target"`
-	Decision       string        `json:"decision"`
-	Summary        string        `json:"summary"`
-	Recommendation string        `json:"recommendation"`
-	Health         int           `json:"health"`
-	AIGenerated    bool          `json:"aiGenerated"`
-	Commits        []commit      `json:"commits"`
-	ChangedFiles   []changedFile `json:"changedFiles"`
-	Validations    []validation  `json:"validations"`
-	Risks          []risk        `json:"risks"`
-	Services       []service     `json:"services"`
-	RollbackPlan   []string      `json:"rollbackPlan"`
-	ReleaseNotes   []string      `json:"releaseNotes"`
+	ID             string           `json:"id"`
+	Name           string           `json:"name"`
+	Provider       string           `json:"provider"`
+	Repository     string           `json:"repository"`
+	BaseBranch     string           `json:"baseBranch"`
+	ReleaseBranch  string           `json:"releaseBranch"`
+	CreatedAt      time.Time        `json:"createdAt"`
+	InitiatedBy    string           `json:"initiatedBy"`
+	Target         string           `json:"target"`
+	Decision       string           `json:"decision"`
+	Summary        string           `json:"summary"`
+	Recommendation string           `json:"recommendation"`
+	Health         int              `json:"health"`
+	AIGenerated    bool             `json:"aiGenerated"`
+	Commits        []commit         `json:"commits"`
+	ChangedFiles   []changedFile    `json:"changedFiles"`
+	Agents         []agentReport    `json:"agents"`
+	BlastRadius    blastRadiusGraph `json:"blastRadius"`
+	Validations    []validation     `json:"validations"`
+	Risks          []risk           `json:"risks"`
+	Services       []service        `json:"services"`
+	RollbackPlan   []string         `json:"rollbackPlan"`
+	ReleaseNotes   []string         `json:"releaseNotes"`
 }
 
 type analyzeRequest struct {
@@ -344,18 +374,38 @@ func (s *store) handleRelease(w http.ResponseWriter, r *http.Request) {
 		s.handlePDF(w, r, strings.TrimSuffix(path, "/pdf"))
 		return
 	}
-	if r.Method != http.MethodGet {
+	switch r.Method {
+	case http.MethodGet:
+		s.mu.RLock()
+		item, ok := s.releases[path]
+		s.mu.RUnlock()
+		if !ok {
+			http.Error(w, "release not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, normalizeRelease(item))
+	case http.MethodDelete:
+		s.mu.Lock()
+		item, ok := s.releases[path]
+		if !ok {
+			s.mu.Unlock()
+			http.Error(w, "release not found", http.StatusNotFound)
+			return
+		}
+		delete(s.releases, path)
+		err := s.saveLocked()
+		if err != nil {
+			s.releases[path] = item
+		}
+		s.mu.Unlock()
+		if err != nil {
+			http.Error(w, "release delete failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
 	}
-	s.mu.RLock()
-	item, ok := s.releases[path]
-	s.mu.RUnlock()
-	if !ok {
-		http.Error(w, "release not found", http.StatusNotFound)
-		return
-	}
-	writeJSON(w, http.StatusOK, normalizeRelease(item))
 }
 
 func (s *store) handleAnalyze(w http.ResponseWriter, r *http.Request) {
@@ -441,17 +491,13 @@ func deterministicRelease(input analyzeRequest, ctx releaseContext) release {
 		ctx.ChangedFiles = []changedFile{}
 	}
 	branchName := strings.TrimPrefix(input.ReleaseBranch, "release/")
-	decision := "NEEDS VALIDATION"
-	health := 68
-	recommendation := "Address high-risk findings and complete mandatory validations before release."
-	if strings.Contains(strings.ToLower(input.ReleaseBranch), "hotfix") {
-		decision, health = "NO-GO", 42
-		recommendation = "Do not proceed until the database and payment retry blockers are resolved."
-	}
 	if input.Provider == "" {
 		input.Provider = "demo"
 	}
 	name := strings.TrimSuffix(input.Repository[strings.LastIndex(input.Repository, "/")+1:], ".git") + " " + branchName
+	agents := runRiskAgents(ctx)
+	risks := deterministicRisks(input, ctx, agents)
+	decision, health, recommendation := synthesizeVerdict(input, risks)
 	return release{
 		ID:             "r-" + now.Format("20060102150405.000000"),
 		Name:           name,
@@ -468,6 +514,8 @@ func deterministicRelease(input analyzeRequest, ctx releaseContext) release {
 		Health:         health,
 		Commits:        ctx.Commits,
 		ChangedFiles:   ctx.ChangedFiles,
+		Agents:         agents,
+		BlastRadius:    buildBlastRadius(input, ctx, name, branchName, decision),
 		Validations: []validation{
 			{Name: "Repository history fetched", Status: statusFromCount(len(ctx.Commits)), Evidence: fmt.Sprintf("%d commits, %d changed files", len(ctx.Commits), len(ctx.ChangedFiles))},
 			{Name: "CI validation", Status: ctx.CI.Status, Evidence: emptyAs(ctx.CI.Evidence, "No pipeline data found")},
@@ -477,7 +525,7 @@ func deterministicRelease(input analyzeRequest, ctx releaseContext) release {
 			{Name: "Canary analysis", Status: "Pending", Evidence: "Not run"},
 			{Name: "Rollback rehearsal", Status: "Pending", Evidence: "Not run"},
 		},
-		Risks:    deterministicRisks(input, ctx),
+		Risks:    risks,
 		Services: []service{{Name: name, Change: branchName, BlastRadius: "High"}},
 		RollbackPlan: []string{
 			"Pause the deployment and disable changed feature flags",
@@ -505,27 +553,186 @@ func enrichReleaseContext(ctx releaseContext) releaseContext {
 	return ctx
 }
 
-func deterministicRisks(input analyzeRequest, ctx releaseContext) []risk {
+func deterministicRisks(input analyzeRequest, ctx releaseContext, agents []agentReport) []risk {
 	risks := []risk{}
+	for _, agent := range agents {
+		risks = append(risks, agent.Findings...)
+	}
 	if len(ctx.ChangedFiles) == 0 {
 		risks = append(risks, risk{Title: "No compare data available", Level: "Medium", Impact: "Release confidence", Evidence: input.ReleaseBranch})
-	}
-	if ctx.CI.Status != "Passed" {
-		risks = append(risks, risk{Title: "CI validation is not passing", Level: "High", Impact: "Release safety", Evidence: emptyAs(ctx.CI.Evidence, "No CI status")})
-	}
-	if ctx.Security.Status == "Failed" {
-		risks = append(risks, risk{Title: "Possible credentials or .env files in release", Level: "Critical", Impact: "Secret exposure", Evidence: ctx.Security.Evidence})
-	}
-	if ctx.Database.Status == "Warning" {
-		risks = append(risks, risk{Title: "Database migration detected", Level: "High", Impact: "Rollback complexity", Evidence: ctx.Database.Evidence})
-	}
-	if ctx.Schema.Status == "Warning" {
-		risks = append(risks, risk{Title: "Schema or API contract change detected", Level: "High", Impact: "Compatibility", Evidence: ctx.Schema.Evidence})
 	}
 	if len(risks) == 0 {
 		risks = append(risks, risk{Title: "No high-risk repository signals detected", Level: "Low", Impact: "Release confidence", Evidence: input.ReleaseBranch})
 	}
 	return risks
+}
+
+func runRiskAgents(ctx releaseContext) []agentReport {
+	return []agentReport{
+		securityAgent(ctx),
+		schemaMigrationAgent(ctx),
+		ciCoverageAgent(ctx),
+		performanceAgent(ctx),
+	}
+}
+
+func securityAgent(ctx releaseContext) agentReport {
+	status, confidence := "Clear", 91
+	findings := []risk{}
+	if ctx.Security.Status == "Failed" {
+		status, confidence = "Blocked", 96
+		findings = append(findings, risk{Title: "Possible credentials or .env files in release", Level: "Critical", Impact: "Secret exposure", Evidence: ctx.Security.Evidence})
+	}
+	return agentReport{Name: "Security Agent", Domain: "Secrets and credentials", Status: status, Confidence: confidence, Summary: ctx.Security.Evidence, Findings: findings}
+}
+
+func schemaMigrationAgent(ctx releaseContext) agentReport {
+	status, confidence := "Clear", 84
+	findings := []risk{}
+	summary := []string{}
+	if ctx.Database.Status == "Warning" {
+		status, confidence = "Review", 90
+		summary = append(summary, "Database: "+ctx.Database.Evidence)
+		findings = append(findings, risk{Title: "Database migration detected", Level: "High", Impact: "Rollback complexity", Evidence: ctx.Database.Evidence})
+	}
+	if ctx.Schema.Status == "Warning" {
+		status, confidence = "Review", max(confidence, 88)
+		summary = append(summary, "Schema: "+ctx.Schema.Evidence)
+		findings = append(findings, risk{Title: "Schema or API contract change detected", Level: "High", Impact: "Compatibility", Evidence: ctx.Schema.Evidence})
+	}
+	if len(summary) == 0 {
+		summary = append(summary, "No database or schema contract files detected")
+	}
+	return agentReport{Name: "Schema/Migration Agent", Domain: "DB and contracts", Status: status, Confidence: confidence, Summary: strings.Join(summary, " | "), Findings: findings}
+}
+
+func ciCoverageAgent(ctx releaseContext) agentReport {
+	status, confidence := "Clear", 82
+	findings := []risk{}
+	if ctx.CI.Status == "Failed" {
+		status, confidence = "Blocked", 94
+		findings = append(findings, risk{Title: "CI validation failed", Level: "High", Impact: "Release safety", Evidence: ctx.CI.Evidence})
+	} else if ctx.CI.Status != "Passed" {
+		status, confidence = "Review", 72
+		findings = append(findings, risk{Title: "CI validation is not passing", Level: "High", Impact: "Release safety", Evidence: emptyAs(ctx.CI.Evidence, "No CI status")})
+	}
+	return agentReport{Name: "Test Coverage Agent", Domain: "CI and validation", Status: status, Confidence: confidence, Summary: emptyAs(ctx.CI.Evidence, "No CI signal available"), Findings: findings}
+}
+
+func performanceAgent(ctx releaseContext) agentReport {
+	findings := []risk{}
+	touched := []string{}
+	totalDelta := 0
+	for _, file := range ctx.ChangedFiles {
+		lower := strings.ToLower(file.Path + " " + file.Patch)
+		totalDelta += file.Additions + file.Deletions
+		if strings.Contains(lower, "timeout") || strings.Contains(lower, "cache") || strings.Contains(lower, "query") || strings.Contains(lower, "loop") || strings.Contains(lower, "payment") || strings.Contains(lower, "checkout") {
+			touched = append(touched, file.Path)
+		}
+	}
+	status, confidence := "Clear", 70
+	summary := "No obvious performance-sensitive paths detected"
+	if totalDelta > 600 || len(touched) > 0 {
+		status, confidence = "Review", 76
+		summary = "Performance-sensitive paths: " + strings.Join(uniqueStrings(touched), ", ")
+		if len(touched) == 0 {
+			summary = fmt.Sprintf("Large release delta: %d changed lines", totalDelta)
+		}
+		findings = append(findings, risk{Title: "Performance-sensitive change needs validation", Level: "Medium", Impact: "Latency or throughput", Evidence: summary})
+	}
+	return agentReport{Name: "Performance Agent", Domain: "Hot paths and diff size", Status: status, Confidence: confidence, Summary: summary, Findings: findings}
+}
+
+func synthesizeVerdict(input analyzeRequest, risks []risk) (string, int, string) {
+	score := 92
+	decision := "GO"
+	for _, item := range risks {
+		switch item.Level {
+		case "Critical":
+			score -= 35
+			decision = "NO-GO"
+		case "High":
+			score -= 18
+			if decision != "NO-GO" {
+				decision = "NEEDS VALIDATION"
+			}
+		case "Medium":
+			score -= 8
+			if decision == "GO" {
+				decision = "NEEDS VALIDATION"
+			}
+		case "Low":
+			score -= 2
+		}
+	}
+	if strings.Contains(strings.ToLower(input.ReleaseBranch), "hotfix") && decision == "GO" {
+		score -= 10
+		decision = "NEEDS VALIDATION"
+	}
+	score = min(100, max(0, score))
+	switch decision {
+	case "NO-GO":
+		return decision, score, "Do not release until blocked agent findings are resolved and revalidated."
+	case "NEEDS VALIDATION":
+		return decision, score, "Complete the highlighted agent validations before approving this release."
+	default:
+		return decision, score, "No blocking agent findings detected. Proceed with standard release checks."
+	}
+}
+
+func buildBlastRadius(input analyzeRequest, ctx releaseContext, serviceName, branchName, decision string) blastRadiusGraph {
+	nodes := []blastNode{{ID: "release", Label: branchName, Kind: "release", Severity: severityFromDecision(decision), Evidence: input.ReleaseBranch}}
+	edges := []blastEdge{}
+	addNode := func(id, label, kind, severity, evidence string) {
+		nodes = append(nodes, blastNode{ID: id, Label: label, Kind: kind, Severity: severity, Evidence: evidence})
+		edges = append(edges, blastEdge{From: "release", To: id, Label: kind})
+	}
+	addNode("service", serviceName, "service", "High", fmt.Sprintf("%d changed files", len(ctx.ChangedFiles)))
+	addNode("ci", "CI validation", "signal", severityFromStatus(ctx.CI.Status), ctx.CI.Evidence)
+	addNode("security", "Secret scan", "signal", severityFromStatus(ctx.Security.Status), ctx.Security.Evidence)
+	addNode("database", "Database", "signal", severityFromStatus(ctx.Database.Status), ctx.Database.Evidence)
+	addNode("schema", "Schema/API", "signal", severityFromStatus(ctx.Schema.Status), ctx.Schema.Evidence)
+	for i, file := range ctx.ChangedFiles {
+		if i >= 5 {
+			break
+		}
+		addNode(fmt.Sprintf("file-%d", i), file.Path, "file", severityFromFile(file.Path), file.Status)
+	}
+	return blastRadiusGraph{Nodes: nodes, Edges: edges}
+}
+
+func severityFromStatus(status string) string {
+	switch status {
+	case "Failed":
+		return "Critical"
+	case "Warning", "Pending":
+		return "Medium"
+	case "Passed":
+		return "Low"
+	default:
+		return "Medium"
+	}
+}
+
+func severityFromFile(path string) string {
+	lower := strings.ToLower(path)
+	if strings.Contains(lower, ".env") || strings.Contains(lower, "secret") || strings.Contains(lower, "credential") {
+		return "Critical"
+	}
+	if strings.Contains(lower, "migration") || strings.Contains(lower, ".sql") || strings.Contains(lower, "openapi") || strings.Contains(lower, "schema") || strings.Contains(lower, ".proto") {
+		return "High"
+	}
+	return "Medium"
+}
+
+func severityFromDecision(decision string) string {
+	if decision == "NO-GO" {
+		return "Critical"
+	}
+	if decision == "GO" {
+		return "Low"
+	}
+	return "Medium"
 }
 
 func releaseNotesFromCommits(history []commit) []string {
@@ -614,6 +821,15 @@ func normalizeRelease(item release) release {
 	}
 	if item.ChangedFiles == nil {
 		item.ChangedFiles = []changedFile{}
+	}
+	if item.Agents == nil {
+		item.Agents = []agentReport{}
+	}
+	if item.BlastRadius.Nodes == nil {
+		item.BlastRadius.Nodes = []blastNode{}
+	}
+	if item.BlastRadius.Edges == nil {
+		item.BlastRadius.Edges = []blastEdge{}
 	}
 	if item.Validations == nil {
 		item.Validations = []validation{}

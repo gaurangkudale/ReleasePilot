@@ -22,6 +22,9 @@ The product analyzes one release candidate and presents:
 - Generated release notes
 - GitHub Actions or GitLab CI validation status
 - Secret, `.env`, database migration, and schema/API contract signals
+- Specialized risk-agent summaries for security, schema/migration, CI/test
+  coverage, and performance
+- Blast-radius visualization showing impacted services, signals, and files
 
 ReleasePilot can fetch real repository history from GitHub and GitLab, inspect
 changed files, read CI status, detect database/schema changes, scan for
@@ -54,6 +57,8 @@ flowchart LR
     Providers --> CI[GitHub Actions and GitLab CI]
     API --> OpenAI[OpenAI Responses API]
     API --> Analyzer[Release Analyzer]
+    Analyzer --> Agents[Specialized Risk Agents]
+    Analyzer --> Blast[Blast Radius Graph]
     Analyzer --> Decision[Release Decision]
     Analyzer --> Risks[Risk Findings]
     Analyzer --> Checks[Validation Checklist]

@@ -23,6 +23,11 @@ document.addEventListener("click", async (event) => {
     await loadRepositoryOptions(providerSelect.value);
   }
   if (event.target.closest("[data-close]")) dialog.close();
+  const deleteButton = event.target.closest("[data-delete-release-id]");
+  if (deleteButton) {
+    await deleteRelease(deleteButton.dataset.deleteReleaseId);
+    return;
+  }
   const view = event.target.closest("[data-release-id]");
   if (view) loadRelease(view.dataset.releaseId);
   if (event.target.closest("[data-reanalyze]") && currentRelease) reanalyze(currentRelease);
@@ -133,6 +138,22 @@ async function reanalyze(release) {
   showToast("Release re-analyzed with current repository history");
 }
 
+async function deleteRelease(id) {
+  const item = currentRelease?.id === id ? currentRelease : releases.find(release => release.id === id);
+  const label = item?.name || id;
+  const confirmed = window.confirm(`Delete "${label}" from local ReleasePilot reports? This only removes the saved local report.`);
+  if (!confirmed) return;
+
+  const response = await fetch(`/api/releases/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!response.ok) {
+    showToast(await response.text());
+    return;
+  }
+  if (currentRelease?.id === id) currentRelease = null;
+  showToast("Release deleted from local reports");
+  await loadReleases();
+}
+
 async function saveSettings(settingsForm) {
   const button = settingsForm.querySelector("[type=submit]");
   button.disabled = true;
@@ -208,27 +229,37 @@ function renderReleases(items) {
       <button class="button primary" data-analyze>Analyze release</button>
     </header>
     <section class="release-list">
-      ${items.map((item) => `
+      ${items.length ? items.map((item) => `
         <article class="release-row">
           <div><strong>${escapeHTML(item.name)}</strong><p>${escapeHTML(item.provider)} · ${escapeHTML(item.repository)} · ${escapeHTML(item.releaseBranch)}</p></div>
           <div><span class="label">Decision</span><strong class="${decisionClass(item.decision)}">${escapeHTML(item.decision)}</strong></div>
           <div><span class="label">Release health</span><strong>${item.health}/100</strong></div>
-          <button class="button secondary" data-release-id="${escapeHTML(item.id)}">View report</button>
+          <div class="row-actions">
+            <button class="button secondary" data-release-id="${escapeHTML(item.id)}">View report</button>
+            <button class="button danger" data-delete-release-id="${escapeHTML(item.id)}" aria-label="Delete ${escapeHTML(item.name)} locally">Delete</button>
+          </div>
         </article>
-      `).join("")}
+      `).join("") : `<div class="empty-state"><strong>No local release reports yet.</strong><p>Run an analysis to create your first saved report.</p></div>`}
     </section>`;
 }
 
 function renderCockpit(item) {
-  const counts = countRisks(item.risks);
+  const agents = item.agents || [];
+  const blastRadius = item.blastRadius || { nodes: [], edges: [] };
+  const changedFiles = item.changedFiles || [];
+  const commits = item.commits || [];
+  const risks = item.risks || [];
+  const validations = item.validations || [];
+  const services = item.services || [];
+  const counts = countRisks(risks);
   app.innerHTML = `
     <header class="page-header">
       <div>
         <button class="back-link icon-button" data-route="releases">← All releases</button>
         <h1>${escapeHTML(item.name)} <span class="badge">${item.aiGenerated ? "OpenAI report" : "Rule-based report"}</span></h1>
-        <p class="meta">${escapeHTML(item.provider)} · ${escapeHTML(item.repository)} · ${item.commits.length} commits · ${item.changedFiles.length} changed files · ${formatDate(item.createdAt)}</p>
+        <p class="meta">${escapeHTML(item.provider)} · ${escapeHTML(item.repository)} · ${commits.length} commits · ${changedFiles.length} changed files · ${formatDate(item.createdAt)}</p>
       </div>
-      <div class="header-actions"><button class="button secondary" data-reanalyze>Re-analyze</button><button class="button primary" data-export-pdf>Export PDF</button></div>
+      <div class="header-actions"><button class="button secondary" data-reanalyze>Re-analyze</button><button class="button danger" data-delete-release-id="${escapeHTML(item.id)}">Delete local</button><button class="button primary" data-export-pdf>Export PDF</button></div>
     </header>
     <section class="panel summary-panel"><div class="panel-header"><h3>Executive summary</h3></div><p>${escapeHTML(item.summary)}</p></section>
     <div class="cockpit">
@@ -249,11 +280,28 @@ function renderCockpit(item) {
           <div><strong class="critical">${counts.Critical}</strong><span>Critical</span></div><div><strong class="high">${counts.High}</strong><span>High</span></div><div><strong class="medium">${counts.Medium}</strong><span>Medium</span></div><div><strong class="low">${counts.Low}</strong><span>Low</span></div>
         </div>
       </section>
+      <section class="panel agents-panel">
+        <div class="panel-header"><h3>Specialized AI risk agents</h3><span class="meta">${agents.length} agent passes</span></div>
+        <div class="agent-grid">
+          ${agents.map(agent => `
+            <article class="agent-card ${agent.status.toLowerCase()}">
+              <div><strong>${escapeHTML(agent.name)}</strong><span>${escapeHTML(agent.domain)}</span></div>
+              <b>${escapeHTML(agent.status)}</b>
+              <p>${escapeHTML(agent.summary)}</p>
+              <small>${agent.confidence}% confidence · ${agent.findings.length} findings</small>
+            </article>
+          `).join("")}
+        </div>
+      </section>
+      <section class="panel blast-panel">
+        <div class="panel-header"><h3>Blast radius visualizer</h3><span class="meta">${(blastRadius.nodes || []).length} nodes</span></div>
+        ${renderBlastRadius(blastRadius)}
+      </section>
       <div class="data-grid">
-        ${tablePanel("Validation checklist", `${item.validations.filter(v => v.status === "Passed").length}/${item.validations.length} passed`, ["Validation","Status","Evidence"], item.validations.map(v => [`<i class="status-dot ${escapeHTML(v.status)}"></i>${escapeHTML(v.name)}`, `<span class="${v.status === "Passed" ? "low" : "medium"}">${escapeHTML(v.status)}</span>`, `<span class="evidence">${escapeHTML(v.evidence)}</span>`]))}
-        ${tablePanel("Risk findings", `${item.risks.length} detected`, ["Risk","Level","Impact","Evidence"], item.risks.map(r => [escapeHTML(r.title), `<span class="${r.level.toLowerCase()}">${escapeHTML(r.level)}</span>`, escapeHTML(r.impact), `<span class="evidence">${escapeHTML(r.evidence)}</span>`]))}
-        ${tablePanel("Affected services", `${item.services.length} services`, ["Service","Change","Blast radius"], item.services.map(s => [escapeHTML(s.name), escapeHTML(s.change), `<span class="${s.blastRadius.toLowerCase()}">${escapeHTML(s.blastRadius)}</span>`]), "services-panel")}
-        ${tablePanel("Changed files", `${item.changedFiles.length} files`, ["Path","Status","+/-"], item.changedFiles.slice(0, 8).map(f => [escapeHTML(f.path), escapeHTML(f.status), `+${f.additions} / -${f.deletions}`]), "files-panel")}
+        ${tablePanel("Validation checklist", `${validations.filter(v => v.status === "Passed").length}/${validations.length} passed`, ["Validation","Status","Evidence"], validations.map(v => [`<i class="status-dot ${escapeHTML(v.status)}"></i>${escapeHTML(v.name)}`, `<span class="${v.status === "Passed" ? "low" : "medium"}">${escapeHTML(v.status)}</span>`, `<span class="evidence">${escapeHTML(v.evidence)}</span>`]))}
+        ${tablePanel("Risk findings", `${risks.length} detected`, ["Risk","Level","Impact","Evidence"], risks.map(r => [escapeHTML(r.title), `<span class="${String(r.level || "medium").toLowerCase()}">${escapeHTML(r.level)}</span>`, escapeHTML(r.impact), `<span class="evidence">${escapeHTML(r.evidence)}</span>`]))}
+        ${tablePanel("Affected services", `${services.length} services`, ["Service","Change","Blast radius"], services.map(s => [escapeHTML(s.name), escapeHTML(s.change), `<span class="${String(s.blastRadius || "medium").toLowerCase()}">${escapeHTML(s.blastRadius)}</span>`]), "services-panel")}
+        ${tablePanel("Changed files", `${changedFiles.length} files`, ["Path","Status","+/-"], changedFiles.slice(0, 8).map(f => [escapeHTML(f.path), escapeHTML(f.status), `+${f.additions} / -${f.deletions}`]), "files-panel")}
       </div>
       <div class="bottom-grid">
         <section class="panel"><div class="panel-header"><h3>Rollback plan</h3></div><ol class="steps">${item.rollbackPlan.map(step => `<li>${escapeHTML(step)}</li>`).join("")}</ol></section>
@@ -296,6 +344,32 @@ function providerSettings(title, key, config, guidance) {
 
 function tablePanel(title, meta, headers, rows, className = "") {
   return `<section class="panel ${className}"><div class="panel-header"><h3>${title}</h3><span class="meta">${meta}</span></div><div class="table-wrap"><table class="table"><thead><tr>${headers.map(h => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.map(row => `<tr>${row.map(cell => `<td>${cell}</td>`).join("")}</tr>`).join("")}</tbody></table></div></section>`;
+}
+
+function renderBlastRadius(graph) {
+  if (!graph || !graph.nodes || graph.nodes.length === 0) {
+    return `<p class="meta">No blast-radius graph available for this report.</p>`;
+  }
+  const release = graph.nodes.find(node => node.id === "release") || graph.nodes[0];
+  const children = graph.nodes.filter(node => node.id !== release.id);
+  return `<div class="blast-map">
+    <div class="blast-center ${severityClass(release.severity)}">
+      <strong>${escapeHTML(release.label)}</strong>
+      <span>${escapeHTML(release.kind)}</span>
+    </div>
+    <div class="blast-nodes">
+      ${children.map(node => `
+        <div class="blast-node ${severityClass(node.severity)}" title="${escapeHTML(node.evidence)}">
+          <strong>${escapeHTML(node.label)}</strong>
+          <span>${escapeHTML(node.kind)} · ${escapeHTML(node.severity)}</span>
+        </div>
+      `).join("")}
+    </div>
+  </div>`;
+}
+
+function severityClass(value) {
+  return String(value || "medium").toLowerCase();
 }
 
 document.addEventListener("click", (event) => {
