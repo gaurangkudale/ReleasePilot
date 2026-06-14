@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ReleasePilot</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#" data-route="releases" aria-label="ReleasePilot home">
+        <span class="brand-mark">RP</span>
+        <span><strong>ReleasePilot</strong><small>AI Release Manager</small></span>
+      </a>
+      <nav>
+        <button class="nav-item active" data-route="releases">Releases</button>
+        <button class="nav-item" data-route="settings">Settings</button>
+      </nav>
+      <div class="connection">
+        <span><i></i> Connected</span>
+        <small>release.manager@acme.com</small>
+        <small>v0.1.0</small>
+      </div>
+    </aside>
+
+    <main id="app" tabindex="-1"></main>
+  </div>
+
+  <dialog id="analyze-dialog">
+    <form id="analyze-form">
+      <div class="modal-header">
+        <div>
+          <p class="eyebrow">New analysis</p>
+          <h2>Analyze a release</h2>
+        </div>
+        <button type="button" class="icon-button" data-close aria-label="Close dialog">×</button>
+      </div>
+      <label>Repository<input name="repository" value="acme/payment-platform" required></label>
+      <div class="field-grid">
+        <label>Base branch<input name="baseBranch" value="main" required></label>
+        <label>Release branch<input name="releaseBranch" value="release/v2.15.0" required></label>
+      </div>
+      <p class="form-error" id="form-error" role="alert"></p>
+      <div class="modal-actions">
+        <button type="button" class="button secondary" data-close>Cancel</button>
+        <button type="submit" class="button primary">Run analysis</button>
+      </div>
+    </form>
+  </dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
